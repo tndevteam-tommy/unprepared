@@ -1,0 +1,7 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local game saves and temporary files
+savegame.json
