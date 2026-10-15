@@ -2,6 +2,12 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
 
 # Local game saves and temporary files
 savegame.json
+
+# Test artifacts (screenshots from failed/visual parity runs)
+tests/parity/_artifacts/
+tests/regression/pixel_goldens/
+*.graphics.json
