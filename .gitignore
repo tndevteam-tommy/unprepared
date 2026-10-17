@@ -10,4 +10,4 @@ savegame.json
 # Test artifacts (screenshots from failed/visual parity runs)
 tests/parity/_artifacts/
 tests/regression/pixel_goldens/
-*.graphics.json
+graphics.json
