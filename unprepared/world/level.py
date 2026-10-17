@@ -7,11 +7,14 @@ no gameplay or rendering code needs to change.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from ..core.math3d import BoundingBox3D, Vector3D
-from ..entities import AIState, Door, DoorKind, DoorSchedule, Item, NPC, ScheduleTask
+from ..entities import AIState, Door, DoorKind, DoorSchedule, Item, NPC, Outfit, ScheduleTask
 from ..entities.inventory import add_item
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .tower import StairDef
 
 Vec = Tuple[float, float, float]
 
@@ -39,21 +42,38 @@ class Wall(BoundingBox3D):
 
 @dataclass(frozen=True)
 class PropDef:
-    """Solid decorative box (bed, table, anvil...). Blocks movement and NPC paths."""
+    """Solid decorative box (bed, table, anvil...). Blocks movement and NPC paths. ``kind`` picks
+    how it is drawn: a plain box, or a modelled structure ("well", "forge", "oven", "sign") that
+    fills the same footprint; ``facing`` is the yaw a modelled structure turns to (0 = its front
+    looks along -z). ``solid=False`` props are decoration only (a hanging sign)."""
     name: str
     min_point: Vec
     max_point: Vec
     texture: str = "building"
+    kind: str = "box"
+    facing: float = 0.0
+    solid: bool = True
+    owner: Optional[str] = None          # a bed's owner; "player" for one the player may sleep in
 
     def build(self) -> "Prop":
-        return Prop(self.name, BoundingBox3D(Vector3D(*self.min_point), Vector3D(*self.max_point)), self.texture)
+        return Prop(self.name, BoundingBox3D(Vector3D(*self.min_point), Vector3D(*self.max_point)), self.texture,
+                    self.kind, self.facing, self.solid, self.owner)
 
 
 class Prop(BoundingBox3D):
-    def __init__(self, name: str, box: BoundingBox3D, texture: str = "building"):
+    def __init__(self, name: str, box: BoundingBox3D, texture: str = "building", kind: str = "box",
+                 facing: float = 0.0, solid: bool = True, owner: Optional[str] = None):
         super().__init__(box.min_point, box.max_point)
         self.name = name
         self.texture = texture
+        self.kind = kind
+        self.facing = facing
+        self.solid = solid
+        self.owner = owner
+
+    @property
+    def is_bed(self) -> bool:
+        return "bed" in self.name
 
     def __repr__(self) -> str:
         return f"Prop({self.name!r}, {self.min_point}, {self.max_point})"
@@ -73,11 +93,12 @@ class ItemDef:
     stackable: bool = False
     quantity: int = 1
     is_food: bool = False
+    category: str = "goods"      # "weapon", "armor", "ore", "food", "clothing", "tool", "key", "service", "goods"
 
     def build(self) -> Item:
         return Item(self.id, self.name, self.value, self.is_stolen, self.noise_modifier,
                     self.is_key, self.key_door_id, self.is_lockpick, self.for_sale, self.stackable, self.quantity,
-                    self.is_food)
+                    self.is_food, category=self.category)
 
 
 @dataclass(frozen=True)
@@ -167,6 +188,7 @@ class DoorDef:
     owners: Tuple[str, ...] = ()         # NPC names / faction tags responsible for the door (they shut and lock it)
     lock_difficulty: int = 1
     kind: DoorKind = DoorKind.LEAF       # BARS: a see-through gate nobody shuts as a side effect (jail cells)
+    swing_out: bool = False              # the leaf folds into +z (towards the street for a north-wall door) when open
 
     def build(self) -> Door:
         schedule = None
@@ -176,7 +198,7 @@ class DoorDef:
                                     self.open_message, self.close_message)
         return Door(self.door_id, Vector3D(*self.hinge_position), width=self.width, height=self.height,
                     is_locked=self.is_locked, key_id=self.key_id, schedule=schedule, owners=self.owners,
-                    lock_difficulty=self.lock_difficulty, kind=self.kind)
+                    lock_difficulty=self.lock_difficulty, kind=self.kind, swing_out=self.swing_out)
 
 
 @dataclass(frozen=True)
@@ -243,7 +265,9 @@ class AreaDef:
 
 @dataclass(frozen=True)
 class BuildingDef:
-    """Footprint of a roofed building: used to draw its floor and gabled roof."""
+    """Footprint of a roofed building: used to draw its floor, ceiling and gabled roof, and
+    to tell indoors from outdoors. ``open_sides`` marks a roof on posts (a shed): it is drawn
+    but counts as outdoors - no walls to muffle sound or stop light, no lantern of its own."""
     name: str
     min_xz: Tuple[float, float]
     max_xz: Tuple[float, float]
@@ -251,6 +275,16 @@ class BuildingDef:
     roof_height: float = 1.6
     roof_texture: str = "roof"
     floor_texture: str = "wood"
+    open_sides: bool = False
+    open_top: bool = False           # no ceiling or roof (a tower with a look-out platform)
+
+
+@dataclass(frozen=True)
+class RoadDef:
+    """A paved rectangle (cobbles) drawn on the ground with soft, grass-blended edges."""
+    min_xz: Tuple[float, float]
+    max_xz: Tuple[float, float]
+    texture: str = "cobble"
 
 
 @dataclass(frozen=True)
@@ -275,7 +309,7 @@ class StationDef:
     max_point: Vec
     texture: str = "stone"
     yields: Optional[ItemDef] = None             # mining: the item produced per use
-    requires_item_id: Optional[str] = None       # tool that must be in the player's inventory
+    requires_item_id: Optional[str] = None       # tool that must be in the player's inventory (a pickaxe to mine, a mallet to forge)
     tool_label: str = "a tool"
     consumes: Optional[Tuple[str, int]] = None   # crafting: (item id, count) used up per batch
     consumes_label: str = "materials"
@@ -327,6 +361,26 @@ class JailDef:
 
 
 @dataclass(frozen=True)
+class InnRoomDef:
+    area: str            # the room's AreaDef name
+    door_id: str         # its (lockable) door
+    bed: Vec             # where a guest may rest
+
+
+@dataclass(frozen=True)
+class InnDef:
+    """An inn: the keeper rents ``rooms`` for ``night_price`` a night or ``week_price`` a week
+    (bought like goods from the keeper's stock), unlocks the room for the stay and shows a guest
+    the door once the rent has run out (after ``checkout_hour`` on the last day)."""
+    keeper: str
+    rooms: Tuple[InnRoomDef, ...]
+    night_price: float = 10.0
+    week_price: float = 50.0
+    checkout_hour: int = 12
+    area: str = "the inn"
+
+
+@dataclass(frozen=True)
 class StockTier:
     """Extra stock a shopkeeper starts carrying once the player has reached ``min_player_level``."""
     min_player_level: int
@@ -351,11 +405,17 @@ class NPCDef:
     restock_tiers: Tuple[StockTier, ...] = ()
     inventory_reset_days: int = 1        # personal items (keys, rations) are replaced after this many days
     gold: float = 0.0                    # coins carried; topped back up to this every ``restock_days``
+    trade_categories: Tuple[str, ...] = ()    # a specialist only buys/sells these item categories (empty = anything)
+    role: str = ""                       # flavour for dialogue: "smith", "innkeeper", "tailor", "shopkeeper", ...
+    outfit: Optional[Outfit] = None      # what they wear; None picks one for the role (see entities/outfit.py)
 
     def build(self, perception_settings=None, npc_settings=None) -> NPC:
         npc = NPC(self.name, self.is_guard, self.is_fence, self.can_trade, Vector3D(*self.home_pos),
                   settings=perception_settings, npc_settings=npc_settings, faction=self.faction)
         npc.gold = npc.base_gold = float(self.gold)
+        npc.trade_categories = tuple(self.trade_categories)
+        npc.role_tag = self.role
+        npc.outfit = self.outfit
         for i in self.inventory:
             add_item(npc.inventory, i.build())
         npc.shop_containers = list(self.shop_containers)
@@ -387,6 +447,9 @@ class LevelDefinition:
     jail: Optional[JailDef] = None
     lights: Tuple[LightDef, ...] = ()          # extra fixtures on top of the generated ones
     auto_lights: bool = True                   # a lantern per room and a candle per table
+    roads: Tuple[RoadDef, ...] = ()            # paving; doorsteps are added automatically for doors set back from it
+    inn: Optional["InnDef"] = None
+    stairs: Tuple["StairDef", ...] = ()       # stairs NPCs climb by their waypoints (see world/tower.py)
     default_area: str = "the streets"
     bounds: Tuple[float, float, float, float] = (-25.0, -25.0, 25.0, 25.0)   # walkable area: min_x, min_z, max_x, max_z
     player_gold: float = 50.0

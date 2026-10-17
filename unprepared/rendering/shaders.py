@@ -7,7 +7,8 @@ from typing import Dict, Optional, Sequence
 from OpenGL.GL import (GL_COMPILE_STATUS, GL_FRAGMENT_SHADER, GL_LINK_STATUS, GL_VERTEX_SHADER, glAttachShader,
                        glCompileShader, glCreateProgram, glCreateShader, glGetProgramInfoLog, glGetProgramiv,
                        glGetShaderInfoLog, glGetShaderiv, glGetUniformLocation, glLinkProgram, glShaderSource,
-                       glUniform1f, glUniform1i, glUniform3f, glUniform3fv, glUniform1fv, glUseProgram)
+                       glUniform1f, glUniform1i, glUniform3f, glUniform3fv, glUniform1fv, glUniform4fv,
+                       glUniformMatrix4fv, glUseProgram)
 
 MAX_POINT_LIGHTS = 8
 
@@ -44,8 +45,12 @@ uniform int uNumLights;
 uniform vec3 uLightPos[MAX_LIGHTS];     // eye space
 uniform vec3 uLightColor[MAX_LIGHTS];
 uniform float uLightRange[MAX_LIGHTS];
+uniform vec4 uLightBounds[MAX_LIGHTS];  // world-space (minX, minZ, maxX, maxZ) the light is confined to
+uniform float uLightBounded[MAX_LIGHTS];// 1.0 = apply the bounds (an indoor light never leaks through the walls)
+uniform mat4 uInvView;                  // eye space -> world space
 uniform vec3 uFogColor;
 uniform float uFogDensity;
+uniform float uFogFar;                  // distance fog: fully fogged at the draw distance (0 = off)
 varying vec3 vEyePos;
 varying vec3 vNormal;
 varying vec2 vTexCoord;
@@ -63,8 +68,13 @@ void main() {
     vec3 light = uAmbient;
     light += uSunColor * max(dot(n, normalize(uSunDir)), 0.0);
     light += uMoonColor * max(dot(n, normalize(uMoonDir)), 0.0);
+    vec3 world = (uInvView * vec4(vEyePos, 1.0)).xyz;
     for (int i = 0; i < MAX_LIGHTS; i++) {
         if (i >= uNumLights) break;
+        if (uLightBounded[i] > 0.5) {
+            vec4 b = uLightBounds[i];
+            if (world.x < b.x || world.z < b.y || world.x > b.z || world.z > b.w) continue;
+        }
         vec3 toLight = uLightPos[i] - vEyePos;
         float dist = length(toLight);
         float atten = clamp(1.0 - dist / uLightRange[i], 0.0, 1.0);
@@ -77,6 +87,10 @@ void main() {
 
     float dist = length(vEyePos);
     float f = exp(-(uFogDensity * dist) * (uFogDensity * dist));
+    if (uFogFar > 0.0) {
+        // whatever is not drawn beyond the draw distance has faded into the fog by then
+        f = min(f, clamp((uFogFar - dist) / (uFogFar * 0.45), 0.0, 1.0));
+    }
     f = clamp(f, 0.0, 1.0);
     f = mix(1.0, f, uFogStrength);
     gl_FragColor = vec4(mix(uFogColor, color, f), alpha * uAlpha);
@@ -142,17 +156,30 @@ class LightingShader:
         glUniform3f(self.loc("uFogColor"), *fog_color)
         glUniform1f(self.loc("uFogDensity"), fog_density)
 
+    def set_fog_far(self, far: float) -> None:
+        """Distance fog that reaches full strength at ``far`` (the object draw distance); 0 disables it."""
+        glUniform1f(self.loc("uFogFar"), far)
+
+    def set_inverse_view(self, matrix: Sequence[float]) -> None:
+        """Column-major eye->world matrix, so the fragment shader can confine indoor lights to their building."""
+        glUniformMatrix4fv(self.loc("uInvView"), 1, False, list(matrix))
+
     def set_point_lights(self, lights: Sequence) -> None:
-        """``lights``: sequence of (eye_pos(3), color(3), range)."""
+        """``lights``: sequence of (eye_pos(3), color(3), range[, bounds]) where ``bounds`` is an
+        optional world-space (min_x, min_z, max_x, max_z) the light may not leave."""
         lights = list(lights)[:MAX_POINT_LIGHTS]
         glUniform1i(self.loc("uNumLights"), len(lights))
         if lights:
             pos = [c for l in lights for c in l[0]]
             col = [c for l in lights for c in l[1]]
             rng = [l[2] for l in lights]
+            bounds = [c for l in lights for c in ((l[3] if len(l) > 3 and l[3] is not None else (0.0, 0.0, 0.0, 0.0)))]
+            bounded = [1.0 if (len(l) > 3 and l[3] is not None) else 0.0 for l in lights]
             glUniform3fv(self.loc("uLightPos"), len(lights), pos)
             glUniform3fv(self.loc("uLightColor"), len(lights), col)
             glUniform1fv(self.loc("uLightRange"), len(lights), rng)
+            glUniform4fv(self.loc("uLightBounds"), len(lights), bounds)
+            glUniform1fv(self.loc("uLightBounded"), len(lights), bounded)
 
     # --- per-object ----------------------------------------------------------------
     def set_material(self, color=(1.0, 1.0, 1.0), emission=(0.0, 0.0, 0.0), textured: bool = True,

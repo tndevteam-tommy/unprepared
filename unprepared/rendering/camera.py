@@ -46,6 +46,23 @@ def look_at_matrix(eye: Tuple[float, float, float], center: Tuple[float, float, 
             0.0, 0.0, 0.0, 1.0]
 
 
+def project(point, eye, center, fovy_degrees: float, aspect: float, width: int, height: int,
+            up=(0.0, 1.0, 0.0)):
+    """World point -> (pixel x, pixel y, eye-space depth) for the camera looking from ``eye`` at
+    ``center``; None when the point is behind the camera. Pixel y grows downwards."""
+    m = look_at_matrix(eye, center, up)
+    dx, dy, dz = point[0] - eye[0], point[1] - eye[1], point[2] - eye[2]
+    ex = m[0] * dx + m[4] * dy + m[8] * dz
+    ey = m[1] * dx + m[5] * dy + m[9] * dz
+    ez = m[2] * dx + m[6] * dy + m[10] * dz
+    if ez > -0.05:
+        return None
+    cot = 1.0 / math.tan(math.radians(fovy_degrees) / 2.0)
+    ndc_x = (cot / aspect) * ex / -ez
+    ndc_y = cot * ey / -ez
+    return ((ndc_x + 1.0) * 0.5 * width, (1.0 - ndc_y) * 0.5 * height, -ez)
+
+
 def apply_perspective(fovy_degrees: float, aspect: float, z_near: float, z_far: float) -> None:
     glMultMatrixd(perspective_matrix(fovy_degrees, aspect, z_near, z_far))
 

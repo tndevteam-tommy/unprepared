@@ -42,6 +42,8 @@ def station_prompt(station, player: Player, settings: Optional[GameSettings] = N
         have = find_item(player.inventory, item_id)
         if have is None or have.quantity < count:
             return f"[{d.label}: needs {d.consumes_label}]"
+        if d.requires_item_id and find_item(player.inventory, d.requires_item_id) is None:
+            return f"[{d.label}: needs {d.tool_label}]"
         if settings is not None:
             n = smithing_yield(player, settings)
             return f"[E] Forge {d.produces.name}s ({d.consumes_label}; up to {n} at your skill)"
@@ -75,6 +77,10 @@ def use_station(player: Player, station, settings: GameSettings, notify: Notify 
         if have is None or have.quantity < count:
             if notify:
                 notify(f"You need {d.consumes_label} to use the {d.label.lower()}. Mine some with a pickaxe.")
+            return None
+        if d.requires_item_id and find_item(player.inventory, d.requires_item_id) is None:
+            if notify:
+                notify(f"You need {d.tool_label} to work the {d.label.lower()}.")
             return None
         take_item(player.inventory, have, count)
         station.uses += 1

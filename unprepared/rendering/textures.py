@@ -18,7 +18,8 @@ from OpenGL.GL import (GL_GENERATE_MIPMAP, GL_LINEAR, GL_LINEAR_MIPMAP_LINEAR, G
 SIZE = 128
 DEFAULT_TEXTURE_KEYS = ("ground", "building", "wall", "guard", "npc", "wood", "bed", "shelf", "door", "ore", "skin",
                         "flame", "sun", "sun_glow", "moon", "stone", "torch", "roof", "roof_slate", "iron", "lockbox",
-                        "lockbox_side", "wax")
+                        "lockbox_side", "wax", "cobble", "cobble_edge", "cloth", "leather", "water", "coals",
+                        "sign_smith", "sign_store", "sign_tailor", "sign_inn")
 
 
 def placeholder_surface(key: str = "") -> pygame.Surface:

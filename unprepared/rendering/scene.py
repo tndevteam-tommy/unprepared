@@ -13,8 +13,10 @@ from .camera import apply_look_at, look_at_matrix
 from .lighting import Camera, LightingRig
 from .models import draw_fixture, draw_held_torch, draw_npc
 from .primitives import draw_box, draw_door, draw_fronted_box, draw_ground, draw_table
+from .roads import draw_roads
 from .shaders import LightingShader
 from .sky import draw_sky_bodies, make_star_field
+from .structures import DRAWERS as STRUCTURES
 from .textures import TextureRegistry
 
 PROP_TEXTURES = {"bed": "bed", "table": "wood", "counter": "wood"}
@@ -90,7 +92,7 @@ class SceneRenderer:
         npc_limit = gfx.character_draw_distance(self.far_plane)
 
         self.lighting.max_lights = gfx.torch_lights
-        atm = self.lighting.begin_frame(game, camera)
+        atm = self.lighting.begin_frame(game, camera, fog_far=object_limit if object_limit < self.far_plane else 0.0)
         if self.shader is not None:
             self.shader.set_contrast(gfx.contrast)
         glClearColor(*atm.sky_color, 1.0)
@@ -104,6 +106,7 @@ class SceneRenderer:
         self.material(textured=True)
         level = world.level
         draw_ground(tex[level.ground_texture], level.ground_half_size, level.ground_texture_repeat, cells=gfx.ground_cells)
+        draw_roads(getattr(world, "roads", ()), tex, self.material)
 
         def draw_if_near(box, texture, tile=2.0):
             if self._within(box, camera.eye, object_limit):
@@ -115,6 +118,12 @@ class SceneRenderer:
         for wall in world.walls:
             draw_if_near(wall, tex[wall.texture])
         for prop in world.props:
+            drawer = STRUCTURES.get(getattr(prop, "kind", "box"))
+            if drawer is not None:
+                if self._within(prop, camera.eye, object_limit):
+                    drawer(prop, tex, self.material, time)
+                    self.drawn_objects += 1
+                continue
             if "table" in prop.name:
                 if self._within(prop, camera.eye, object_limit):
                     draw_table(prop, tex[prop_texture_key(prop)])
@@ -140,9 +149,12 @@ class SceneRenderer:
             draw_if_near(lintel, tex[lintel.texture])
         if gfx.roofs:
             for building in level.buildings:
-                draw_floor(building, tex[building.floor_texture])
+                if not building.open_sides:
+                    draw_floor(building, tex[building.floor_texture])
+                if getattr(building, "open_top", False):
+                    continue                          # a tower: its platform is a prop and the sky is its roof
                 draw_ceiling(building, tex[building.floor_texture])
-                draw_roof(building, tex[building.roof_texture])
+                draw_roof(building, tex[building.roof_texture], tex["wood"])
         for door in world.doors:
             if self._within(door.collider(), camera.eye, object_limit):
                 draw_door(door, tex["door"], bars_texture_id=tex["iron"])

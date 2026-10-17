@@ -4,12 +4,14 @@ from __future__ import annotations
 import math
 
 from OpenGL.GL import (GL_BLEND, GL_DEPTH_TEST, GL_EMISSION, GL_FRONT_AND_BACK, GL_LIGHTING, GL_LINES, GL_LINE_LOOP,
-                       GL_MODELVIEW, GL_ONE_MINUS_SRC_ALPHA, GL_POINTS, GL_PROJECTION, GL_SRC_ALPHA, glBegin,
+                       GL_MODELVIEW, GL_ONE_MINUS_SRC_ALPHA, GL_POINTS, GL_PROJECTION, GL_SRC_ALPHA, GL_TRIANGLES, glBegin,
                        glBlendFunc, glColor3f, glColor4f, glDisable, glEnable, glEnd, glLineWidth, glLoadIdentity,
                        glMaterialfv, glMatrixMode, glOrtho, glPointSize, glPopMatrix, glPushMatrix, glVertex2f)
 
 from ..config import HudColors, HudLayout
+from ..core.math3d import view_direction
 from ..systems import Side
+from .camera import project
 from .primitives import fill_rect_2d
 from .text import TextRenderer
 
@@ -42,10 +44,12 @@ class HudRenderer:
         self.layout = layout
         self.colors = colors
         self.controls_help = controls_help
+        self.fov = 60.0                  # kept in step with the renderer's projection (for speech bubbles)
 
     # ------------------------------------------------------------------ frame
     def render(self, game) -> None:
         self._begin_2d()
+        self._draw_speech_bubbles(game)
         self._draw_status_bar(game)
         if game.interaction_prompt and game.in_explore_mode:
             self._draw_prompt(game.interaction_prompt)
@@ -61,6 +65,57 @@ class HudRenderer:
             self._draw_confirmation(game.confirmation)
         self.draw_fade(getattr(game, "fade_alpha", 0.0))
         self._end_2d()
+
+    # ------------------------------------------------------------------ speech bubbles
+    BUBBLE_MAX_WIDTH = 280
+    BUBBLE_HEAD_HEIGHT = 2.05            # world units above an NPC's feet where the bubble points
+
+    def _draw_speech_bubbles(self, game) -> None:
+        """Word-wrapped bubbles above the heads of speakers the player can hear (``Game.speech_bubbles``),
+        kept inside the window; when two would overlap the later one is nudged upwards."""
+        speakers = game.speech_bubbles() if hasattr(game, "speech_bubbles") else []
+        if not speakers:
+            return
+        player = game.player
+        eye = player.eye_position
+        dx, dy, dz = view_direction(player.rotation_y, player.rotation_x)
+        center = (eye.x + dx, eye.y + dy, eye.z + dz)
+        w, h = self.layout.width, self.layout.height
+        measure = lambda t: self.text.measure(t, self.text.font_small)   # noqa: E731
+        placed = []
+        items = []
+        for npc, speech in speakers:
+            head = (npc.position.x, npc.position.y + self.BUBBLE_HEAD_HEIGHT, npc.position.z)
+            hit = project(head, (eye.x, eye.y, eye.z), center, self.fov, w / h, w, h)
+            if hit is None:
+                continue
+            items.append((hit[2], hit[0], hit[1], npc, speech))
+        items.sort(key=lambda it: -it[0])            # far speakers first, near ones drawn on top
+        for depth, sx, sy, npc, speech in items:
+            lines = wrap_text(speech.text, self.BUBBLE_MAX_WIDTH - 24, measure)
+            line_h = measure("Ag")[1] + 2
+            bw = max(measure(line)[0] for line in [npc.name, *lines]) + 24
+            bh = 12 + line_h * (len(lines) + 1)      # the name on its own line, then the text
+            x1 = int(max(6, min(w - bw - 6, sx - bw / 2)))
+            y1 = int(sy - bh - 14)
+            y1 = max(self.layout.top_bar_height + 6, min(h - bh - 6, y1))
+            for _ in range(8):                        # slide up out of any bubble already drawn
+                if not any(x1 < px2 and x1 + bw > px1 and y1 < py2 and y1 + bh > py1 for px1, py1, px2, py2 in placed):
+                    break
+                y1 -= bh + 6
+            y1 = max(self.layout.top_bar_height + 6, y1)
+            placed.append((x1, y1, x1 + bw, y1 + bh))
+            fill_rect_2d(x1, y1, x1 + bw, y1 + bh, self.colors.bubble)
+            fill_rect_2d(x1 + 2, y1 + 2, x1 + bw - 2, y1 + bh - 2, self.colors.bubble_fill)
+            tip_x = int(max(x1 + 12, min(x1 + bw - 12, sx)))
+            if y1 + bh + 12 <= sy:                    # a little tail towards the speaker
+                glBegin(GL_TRIANGLES)
+                glColor4f(*self.colors.bubble_fill)
+                glVertex2f(tip_x - 7, y1 + bh - 2); glVertex2f(tip_x + 7, y1 + bh - 2); glVertex2f(tip_x, y1 + bh + 10)
+                glEnd()
+            self.text.draw(npc.name, x1 + 12, y1 + 6, self.text.font_small, self.colors.bubble_name)
+            for idx, line in enumerate(lines):
+                self.text.draw(line, x1 + 12, y1 + 6 + line_h * (idx + 1), self.text.font_small, self.colors.bubble_text)
 
     def draw_fade(self, alpha: float) -> None:
         """Black overlay for scene transitions (0 = clear, 1 = fully black)."""

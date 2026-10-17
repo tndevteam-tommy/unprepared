@@ -19,6 +19,7 @@ class Item:
     quantity: int = 1
     is_food: bool = False          # NPCs eat these at meal times
     owner: Optional[str] = None    # "player": the player's own property (taking it back is never theft)
+    category: str = "goods"        # what kind of thing it is (specialist merchants trade only some categories)
 
     PLAYER_OWNER = "player"
 
@@ -41,7 +42,7 @@ class Item:
         count = max(1, min(count, self.quantity))
         self.quantity -= count
         return Item(self.id, self.name, self.value, self.is_stolen, self.noise_modifier, self.is_key, self.key_door_id,
-                    self.is_lockpick, self.for_sale, self.stackable, count, self.is_food, self.owner)
+                    self.is_lockpick, self.for_sale, self.stackable, count, self.is_food, self.owner, self.category)
 
     def opens(self, door_id: str) -> bool:
         return self.is_key and self.key_door_id == door_id
@@ -55,7 +56,7 @@ class Item:
             "is_stolen": self.is_stolen, "noise_modifier": self.noise_modifier,
             "is_key": self.is_key, "key_door_id": self.key_door_id, "is_lockpick": self.is_lockpick,
             "for_sale": self.for_sale, "stackable": self.stackable, "quantity": self.quantity, "is_food": self.is_food,
-            "owner": self.owner,
+            "owner": self.owner, "category": self.category,
         }
 
     @staticmethod
@@ -66,5 +67,5 @@ class Item:
             is_key=d.get("is_key", False), key_door_id=d.get("key_door_id"),
             is_lockpick=d.get("is_lockpick", False), for_sale=d.get("for_sale", True),
             stackable=d.get("stackable", False), quantity=d.get("quantity", 1), is_food=d.get("is_food", False),
-            owner=d.get("owner"),
+            owner=d.get("owner"), category=d.get("category", "goods"),
         )

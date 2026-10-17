@@ -41,6 +41,11 @@ class BoundingBox3D:
             self.min_point.z <= other.max_point.z and self.max_point.z >= other.min_point.z
         )
 
+    @property
+    def center(self) -> Vector3D:
+        return Vector3D((self.min_point.x + self.max_point.x) / 2, (self.min_point.y + self.max_point.y) / 2,
+                        (self.min_point.z + self.max_point.z) / 2)
+
     @staticmethod
     def around(center: Vector3D, half_x: float, height: float, half_z: float, base_y: float = 0.0) -> "BoundingBox3D":
         """Box centred on ``center`` in X/Z and standing on ``center.y + base_y``."""

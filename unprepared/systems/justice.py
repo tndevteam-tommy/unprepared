@@ -264,6 +264,7 @@ def check_jailbreak(world: "World", player: Player, notify: Notify = None) -> bo
         door.sealed = False
     if notify:
         notify("You have broken out of jail! The guards will not forget this.")
-    world.declare_crime("Jailbreak", player.position.copy(), witnessed=False, reporter=jail.jailer or "the jailer")
+    # the empty cell is where the alarm is raised: the guards in earshot of the jail come running there
+    world.declare_crime("Jailbreak", jail.cell_spot.copy(), witnessed=False, reporter=jail.jailer or "the jailer")
     jail.sentence_end_day = None
     return True

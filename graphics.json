@@ -1,6 +1,6 @@
 {
   "quality": "high",
-  "auto_quality": true,
+  "auto_quality": false,
   "fov": 60.0,
   "object_fade": 1.0,
   "character_fade": 1.0,
@@ -15,5 +15,5 @@
   "roofs": true,
   "show_perf_overlay": false,
   "detected_renderer": "AMD Radeon(TM) Graphics",
-  "benchmark_ms": 9.33
+  "benchmark_ms": 34.13
 }

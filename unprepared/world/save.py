@@ -3,8 +3,9 @@
 Version 2 added the clock minutes, player orientation, door states and NPC
 inventories/torches; version 3 containers, item stacks and crime counters;
 version 4 the jail; version 5 NPC purses, container locks, item ownership and a
-``meta`` block so the save menus can list saves without loading them. Older
-files still load (missing fields keep their current values).
+``meta`` block so the save menus can list saves without loading them; version 6
+puts the player's position at their feet (older saves are lowered on loading).
+Older files still load (missing fields keep their current values).
 
 Saves live in two places: the *quick save* file (``filename``, F5/F9) and the
 ``saves/`` directory next to it, one file per named save. ``list_saves`` returns
@@ -23,7 +24,7 @@ from .world import World
 
 Notify = Optional[Callable[[str], None]]
 
-SAVE_VERSION = 5
+SAVE_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,7 @@ class SaveManager:
             "doors": [door.to_dict() for door in world.doors],
             "containers": [c.to_dict() for c in world.containers],
             "jail": world.jail.to_dict(),
+            "inn": world.inn.to_dict(),
         }
 
     @staticmethod
@@ -88,10 +90,13 @@ class SaveManager:
             if container.name in container_map:
                 container.load_dict(container_map[container.name])
         world.jail.load_dict(save_data.get("jail", {}))
+        world.inn.load_dict(save_data.get("inn", {}))
         if save_data.get("version", 1) < 5:
             for item in player.inventory:          # pre-ownership saves: what you carry (unstolen) is yours
                 if not item.is_stolen and item.owner is None:
                     item.owner = item.PLAYER_OWNER
+        if save_data.get("version", 1) < 6:
+            player.position.y = 0.0                # older saves kept the player a unit up; the feet are on the floor now
         world.resync_schedules(announce=False, doors=False)      # doors stay exactly as saved
 
     # ------------------------------------------------------------------ files

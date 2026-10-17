@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import math
+import random
+import zlib
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..config import NPCSettings, PerceptionSettings
 from ..core.daynight import DayNightCycle
+from ..core import dialogue
 from ..core.math3d import BoundingBox3D, Vector3D, ray_intersects_box
 from .door import Door
 from .inventory import add_item, take_item
 from .items import Item
+from .outfit import Outfit, outfit_for
 from .player import Player
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -34,11 +38,28 @@ class AIState(Enum):
     IDLE = 12           # at a task location but unable to do it (no food...)
     WAITING = 13        # standing awake, watching the player, until they leave (a jailer after a
     #                     release, a resident who has asked a late guest to go)
+    STROLLING = 14      # a townsperson wandering a route along the street (pausing at each stop)
+    SHOPPING = 15       # standing at a merchant's counter, browsing (a simulated customer)
+    WORKING = 16        # at a work station: the anvil, the forge, the kitchen, hauling crates
+    DRINKING = 17       # seated at an inn table
+    CLEANING = 18       # the innkeeper going table to table
 
 
 ALARMED_STATES = (AIState.REPORTING, AIState.ALERT_GUARDS)
 BUSY_STATES = (AIState.INVESTIGATING, AIState.REPORTING, AIState.ALERT_GUARDS, AIState.RESPONDING, AIState.FOLLOWING,
                AIState.WAITING)
+ROUTE_STATES = (AIState.PATROL, AIState.STROLLING, AIState.CLEANING)     # tasks with ``patrol_points`` walk a round
+# states in which an NPC is at leisure to stop for a chat
+SOCIABLE_STATES = (AIState.PATROL, AIState.GUARDING, AIState.SHOPKEEPING, AIState.STROLLING, AIState.SHOPPING,
+                   AIState.WORKING, AIState.DRINKING, AIState.CLEANING, AIState.EATING, AIState.IDLE)
+
+
+@dataclass
+class Speech:
+    """Something an NPC just said: shown as a bubble above their head until ``until``."""
+    text: str
+    started: float
+    until: float
 
 
 @dataclass
@@ -123,7 +144,7 @@ PendingLock = DoorPassage   # backwards-compatible alias
 
 class NPC:
     EYE_HEIGHT = 1.6
-    TARGET_HEIGHT = 1.2      # the player's chest: low furniture (counters, tables) does not hide them
+    TARGET_HEIGHT = 1.35     # the player's chest when standing: low furniture (counters, tables) does not hide them
     SEARCH_SECONDS = 20.0    # how long a responding guard looks around before giving up
     FOLLOW_SECONDS = 12.0    # how long a guard keeps tailing a player who stopped skulking
     BODY_RADIUS = 0.4        # personal space: NPCs never walk into each other or the player
@@ -160,6 +181,17 @@ class NPC:
         self.gold = 0.0                  # coins in the purse (stolen by pickpockets, spent on purchases)
         self.base_gold = 0.0             # topped back up to this every restock cycle
         self.last_gold_restock_day = 0
+        self.trade_categories: Tuple[str, ...] = ()   # a specialist merchant's categories (empty = trades anything)
+        self.role_tag = ""               # flavour for dialogue ("smith", "innkeeper", ...)
+        self.outfit: Optional[Outfit] = None   # what they wear (None: ``outfit_for`` the role when drawn)
+        self.rng = random.Random(zlib.crc32(name.encode("utf-8")) & 0xFFFF)   # for picking phrasings (the world installs its own)
+        # talk
+        self.time = 0.0                  # world time as of the last movement update
+        self.speech: Optional[Speech] = None
+        self.conversation = None         # the Conversation this NPC is part of, if any
+        self.next_chat_time = 0.0        # world time before which this NPC will not start another chat
+        self.chat_pause = False          # standing still mid-conversation
+        self.chatter_timer = 20.0        # seconds until the next bit of ambient chatter
         # crime bookkeeping
         self.crimes_witnessed = 0
         self.sightings: List[Sighting] = []
@@ -168,6 +200,8 @@ class NPC:
         self.crime_memories: List[CrimeMemory] = []
         # alarm / investigation
         self.goal: Optional[Vector3D] = None       # where an investigating/responding guard is heading
+        self.report_to: Optional[TheftReport] = None   # a guard on his way to take a shopkeeper's theft report
+        self.report_timer = 0.0                   # how long he has been trying to reach the reporter
         self.search_timer = 0.0
         self.follow_timer = 0.0
         self.heard_noise_at: Optional[Vector3D] = None
@@ -178,6 +212,8 @@ class NPC:
         self.curfew_asks = 0
         self.curfew_ask_timer = 0.0
         self.waiting_for: Optional[str] = None     # why the NPC is WAITING ("release", "curfew")
+        self.locked_out = False          # walking to / standing outside a building it cannot get into yet
+        self.retry_timer = 0.0           # seconds until a blocked task is tried again
         # shopkeeping / household
         self.shop_containers: List[str] = []
         self.restock_days = 3
@@ -222,12 +258,52 @@ class NPC:
 
     @property
     def is_patrolling(self) -> bool:
-        return (self.state is AIState.PATROL and self.current_task is not None
+        """Walking a round (guards on patrol, strollers, the innkeeper cleaning)."""
+        return (self.state in ROUTE_STATES and self.current_task is not None
                 and bool(self.current_task.patrol_points))
 
     @property
     def is_open_for_business(self) -> bool:
-        return self.can_trade and self.state is AIState.SHOPKEEPING
+        """Merchants trade from their counter; the smith also sells while working at his anvil and forge."""
+        return self.can_trade and self.state in (AIState.SHOPKEEPING, AIState.WORKING)
+
+    @property
+    def is_sociable(self) -> bool:
+        return not self.is_asleep and self.state in SOCIABLE_STATES and self.suspicion_meter < self.settings.schedule_override_threshold
+
+    @property
+    def clothes(self) -> Outfit:
+        """The outfit to draw: the one the level gave them, or the one their role calls for."""
+        if self.outfit is None:
+            self.outfit = outfit_for(self.name, self.role_tag, self.is_guard)
+        return self.outfit
+
+    def buys(self, item: Item) -> bool:
+        """A specialist (the smith, the tailor) only deals in certain kinds of goods."""
+        return not self.trade_categories or item.category in self.trade_categories
+
+    # ------------------------------------------------------------------ talk
+    SPEECH_BASE_SECONDS = 7.5            # a bubble stays up this long ...
+    SPEECH_SECONDS_PER_CHAR = 0.16       # ... plus reading time for a longer line
+
+    def say(self, text: str, notify_callback: Notify = None, duration: Optional[float] = None,
+            log_prefix: Optional[str] = None) -> Speech:
+        """Speak a line: it goes to the log as ``(Name): "text"`` (``log_prefix`` replaces the name,
+        e.g. "Orrin witnessed Theft!") and into a speech bubble above the NPC's head."""
+        if duration is None:
+            duration = self.SPEECH_BASE_SECONDS + self.SPEECH_SECONDS_PER_CHAR * len(text)
+        self.speech = Speech(text, self.time, self.time + duration)
+        if notify_callback:
+            notify_callback(f"({log_prefix or self.name}): \"{text}\"")
+        return self.speech
+
+    def phrase(self, kind: str, **fmt) -> str:
+        return dialogue.line(kind, self.rng, **fmt)
+
+    def current_speech(self, now: float) -> Optional[Speech]:
+        if self.speech is not None and self.speech.until <= now:
+            self.speech = None
+        return self.speech
 
     @property
     def is_shopkeeper(self) -> bool:
@@ -258,15 +334,22 @@ class NPC:
         if dx or dz:
             self.facing_yaw = math.degrees(math.atan2(dx, -dz)) % 360.0
 
-    def has_line_of_sight(self, target: Vector3D, walls: Sequence[BoundingBox3D]) -> bool:
+    def has_line_of_sight(self, target: Vector3D, walls: Sequence[BoundingBox3D], target_height: Optional[float] = None) -> bool:
+        """Eye to the target's chest (``target_height`` above its feet; a crouching player's is
+        lower, so a counter or table can hide them)."""
         eye = Vector3D(self.position.x, self.position.y + self.EYE_HEIGHT, self.position.z)
-        aim = Vector3D(target.x, target.y + self.TARGET_HEIGHT, target.z)
+        aim = Vector3D(target.x, target.y + (self.TARGET_HEIGHT if target_height is None else target_height), target.z)
         return not any(ray_intersects_box(eye, aim, wall) for wall in walls)
 
-    def can_see(self, target: Vector3D, blockers: Sequence[BoundingBox3D]) -> bool:
+    @staticmethod
+    def chest_height(player: Player) -> float:
+        """Where to look for the player: a little below their eyes, whatever their stance."""
+        return max(0.3, player.current_eye_height - 0.2)
+
+    def can_see(self, target: Vector3D, blockers: Sequence[BoundingBox3D], target_height: Optional[float] = None) -> bool:
         """Awake, within view distance, inside the field of view and not behind a wall."""
         return (not self.is_asleep and self.position.distance_to(target) <= self.view_distance
-                and self.faces(target) and self.has_line_of_sight(target, blockers))
+                and self.faces(target) and self.has_line_of_sight(target, blockers, target_height))
 
     # ------------------------------------------------------------------ doors & keys
     def has_key_for(self, door: Door) -> bool:
@@ -312,17 +395,26 @@ class NPC:
         self.crime_memories.clear()
         self.pending_confrontations.clear()
 
-    def raise_alarm(self, notify_callback: Notify, guard_line: str, citizen_line: str) -> None:
+    def raise_alarm(self, notify_callback: Notify, guard_line: Optional[str] = None, citizen_line: Optional[str] = None,
+                    log_prefix: Optional[str] = None) -> None:
+        """Drop everything and shout: guards go after the player, citizens cry for the guards.
+        Lines default to a phrasing of "halt" / "cry_for_help"."""
         self.path = []
         self.patrol_wait = 0.0
+        self.end_conversation()
         if self.is_guard:
             self.state = AIState.ALERT_GUARDS
-            if notify_callback:
-                notify_callback(guard_line)
+            self.say(guard_line or self.phrase("halt"), notify_callback, log_prefix=log_prefix)
         else:
             self.state = AIState.REPORTING
-            if notify_callback:
-                notify_callback(citizen_line)
+            self.say(citizen_line or self.phrase("cry_for_help"), notify_callback, log_prefix=log_prefix)
+
+    def end_conversation(self) -> None:
+        """Break off a chat (the world finishes the bookkeeping for the other party)."""
+        conv = self.conversation
+        if conv is not None:
+            conv.finished = True
+        self.chat_pause = False
 
     # ------------------------------------------------------------------ daily routine
     def task_for(self, hour: int) -> Optional[ScheduleTask]:
@@ -346,9 +438,21 @@ class NPC:
             # Calmed down after an alarm/investigation: resume the routine.
             self.begin_task(task, world, notify_callback, doors=doors)
 
+    def retry_blocked_task(self, world: "World", delta_time: float, notify_callback: Notify = None) -> None:
+        """Locked out: every ``locked_out_retry`` seconds see whether the door has opened."""
+        if not (self.locked_out and self.state is AIState.IDLE and self.current_task is not None):
+            return
+        self.retry_timer -= delta_time
+        if self.retry_timer > 0.0:
+            return
+        task = self.current_task
+        self.current_task = None                     # so begin_task treats it as fresh (no departure effects)
+        self.begin_task(task, world, notify_callback)
+
     def resume_routine(self, world: "World", notify_callback: Notify = None) -> None:
         """Drop whatever interrupted the NPC and go back to the current task."""
         self.goal = None
+        self.report_to = None
         self.search_timer = 0.0
         self.follow_timer = 0.0
         task = self.task_for(world.clock.hour)
@@ -370,23 +474,38 @@ class NPC:
                 self._add_passage(door_id, lock=True)
             if world is not None:
                 world.on_task_left(self, previous, task)
+        self.locked_out = False
         if not self.path or self.position.distance_to(task.target_pos) <= self.npc_settings.arrival_tolerance:
             self.path = []
             if world is not None and self.position.distance_to(task.target_pos) > self.npc_settings.arrival_tolerance:
-                # No route (a locked door we have no key for): wait where we are, grumbling.
-                self.state = AIState.IDLE
-                if notify_callback:
-                    notify_callback(f"({self.name}): \"I can't get in... where is my key?!\"")
+                # No route yet (a shop not open, a door somebody else has the key to): go and wait
+                # outside its door and try again in a little while.
+                spot = world.waiting_spot_for(task.target_pos)
+                outside = world.find_path(self, spot) if spot is not None else []
+                self.locked_out = True
+                if outside and self.position.distance_to(spot) > self.npc_settings.arrival_tolerance * 3:
+                    self.path = outside
+                    self.state = AIState.TRAVELING
+                else:
+                    self.state = AIState.IDLE
+                    self.retry_timer = self.npc_settings.locked_out_retry
+                    if previous is not task:
+                        self.say(self.phrase("locked_out"))
                 return
             self.arrive(world, notify_callback, doors=doors)
         else:
             self.state = AIState.TRAVELING
-            if task.depart_text and notify_callback:
-                notify_callback(f"({self.name}): \"{task.depart_text}\"")
+            if task.depart_text:
+                self.say(task.depart_text, notify_callback)
 
     def arrive(self, world: Optional["World"] = None, notify_callback: Notify = None, doors: bool = True) -> None:
         task = self.current_task
         if task is None:
+            return
+        if self.locked_out:                          # reached the doorstep of a place still shut
+            self.state = AIState.IDLE
+            self.retry_timer = self.npc_settings.locked_out_retry
+            self.say(self.phrase("locked_out"))
             return
         self.state = task.target_state
         self.patrol_wait = 0.0
@@ -412,7 +531,7 @@ class NPC:
         if task.target_state is AIState.EATING:
             self._eat(world, notify_callback, task)
         elif notify_callback:
-            notify_callback(f"({self.name}): \"{task.action_text}\"")
+            notify_callback(f"({self.name}): \"{task.action_text}\"")      # narration: logged, not spoken
         if world is not None:
             world.on_task_arrived(self, task)
 
@@ -436,8 +555,7 @@ class NPC:
                     return
         self.hungry = True
         self.state = AIState.IDLE
-        if notify_callback:
-            notify_callback(f"({self.name}): \"There's nothing to eat! Has someone been at the food?\"")
+        self.say(self.phrase("no_food"), notify_callback)
 
     # ------------------------------------------------------------------ movement
     def go_to(self, world: "World", target: Vector3D, state: AIState) -> bool:
@@ -458,6 +576,10 @@ class NPC:
         and being blocked anywhere for long enough abandons the walk.
         """
         start = self.position.copy()
+        self.time = getattr(world, "elapsed", self.time + delta_time)
+        if self.chat_pause:
+            self._process_pending_locks(world)
+            return                                   # stopped for a chat: the round resumes afterwards
         if self.is_patrolling and not self.path:
             self._advance_patrol(world, delta_time)
         moving_states = (AIState.TRAVELING, AIState.RESPONDING, AIState.INVESTIGATING, AIState.FOLLOWING, AIState.WAITING)
@@ -481,6 +603,10 @@ class NPC:
                     step_z = self.position.z + dz / dist * remaining
                     cost = remaining
                 if bodies and self._crowded(step_x, step_z, bodies):
+                    goal = self.path[-1]
+                    if self.position.distance_to(goal) <= self.CROWD_TOLERANCE:
+                        self.path = []                 # somebody is standing on our spot: near enough
+                        break
                     side = self._sidestep(dx, dz, dist, remaining, bodies)
                     if side is None:
                         blocked = True
@@ -489,6 +615,8 @@ class NPC:
                     remaining = 0
                     continue
                 self.position.x, self.position.z = step_x, step_z
+                if target.y != self.position.y:          # a stair: rise (or drop) with the waypoints
+                    self.position.y = target.y if cost == dist else self.position.y + (target.y - self.position.y) * cost / dist
                 remaining -= cost
                 if cost == dist:
                     self.path.pop(0)
@@ -557,9 +685,13 @@ class NPC:
         self.pending_locks.append(passage)
         return passage
 
-    def _will_pass_through(self, door: Door) -> bool:
-        """True if the upcoming path crosses the door's plane inside the doorway."""
+    def _will_pass_through(self, door: Door, start: Optional[Vector3D] = None) -> bool:
+        """True if the path crosses the door's plane inside the doorway - the step just taken
+        (from ``start``; a long frame can carry an NPC clean through a doorway) or the next
+        few waypoints."""
         points = [self.position, *self.path[:3]]
+        if start is not None:
+            points.insert(0, start)
         return any(_crosses_door_line(door, a, b) for a, b in zip(points, points[1:]))
 
     def _touch_doors(self, world: "World", start: Vector3D, end: Vector3D) -> None:
@@ -571,7 +703,7 @@ class NPC:
             region = self._door_region(door)
             if not (_contains_xz(region, end) or _segment_crosses_xz(region, start, end)):
                 continue
-            if not self._will_pass_through(door):
+            if not self._will_pass_through(door, start):
                 continue
             if not door.is_open:
                 if not self.can_open(door):
@@ -580,7 +712,7 @@ class NPC:
                 door.unlock_and_open()
                 if not door.auto_closes:
                     continue                     # bars stay as they were left: open and unlocked
-                passage = self._add_passage(door.door_id, lock=was_locked and self.can_lock(door))
+                passage = self._add_passage(door.door_id, lock=(was_locked or self.owns(door)) and self.can_lock(door))
             elif door.auto_closes and self.owns(door) and self.can_lock(door):
                 passage = self._add_passage(door.door_id, lock=True)
             else:
@@ -641,8 +773,7 @@ class NPC:
                 if p_noise > s.wake_noise_threshold:
                     self.state = AIState.INVESTIGATING
                     self.heard_noise_at = player.position.copy()
-                    if notify_callback:
-                        notify_callback(f"({self.name} woke up!): \"Who's there?! Making all that noise!\"")
+                    self.say(self.phrase("woke_up"), notify_callback, log_prefix=f"{self.name} woke up!")
             elif is_acting_suspicious:
                 self.heard_noise_at = player.position.copy()
 
@@ -658,33 +789,27 @@ class NPC:
         if self.has_torch and dist <= s.torch_light_reach:
             p_vis = max(p_vis, s.torch_lit_visibility)      # the NPC's own torch lights up whoever is close
         seen = (dist <= effective_view_dist and self.faces(player.position) and not self.sneak_hidden
-                and self.has_line_of_sight(player.position, walls) and (p_vis > s.min_visibility_to_notice or trespassing))
+                and self.has_line_of_sight(player.position, walls, self.chest_height(player))
+                and (p_vis > s.min_visibility_to_notice or trespassing))
         if seen:
             gain = (p_vis / max(dist, 1.0)) * s.seen_suspicion_gain
             if trespassing:
                 gain += s.trespass_suspicion_gain
-                self.scold("trespass", f"({self.name}): \"Hey! You've no business in here. Out!\"", notify_callback,
-                           player=player)
+                self.scold("trespass", "trespass", notify_callback, player=player)
             if dark_and_unlit and self.is_guard:
-                self.scold("torch", f"({self.name}): \"It's the law to carry a lit torch after dark. Light one, now!\"",
-                           notify_callback, player=player)
+                self.scold("torch", "torch_law", notify_callback, player=player)
             self.suspicion_meter += gain * delta_time
             if self.suspicion_meter >= s.schedule_override_threshold:
                 self.turn_towards(player.position)
                 if self.is_guard:
-                    self.scold("skulking", f"({self.name}): \"You there! What are you skulking about for?\"",
-                               notify_callback, player=player)
+                    self.scold("skulking", "skulking", notify_callback, player=player)
             if self.in_warning_grace:
                 self.suspicion_meter = min(self.suspicion_meter, s.alarm_threshold - 1.0)
         else:
             self._decay(delta_time * 0.5)
 
         if self.suspicion_meter >= s.alarm_threshold and not self.is_alarmed and seen:
-            self.raise_alarm(
-                notify_callback,
-                f"({self.title}): \"Halt right there, criminal scum!\"",
-                f"({self.title}): \"Guards! Help! A criminal is committing crimes!\"",
-            )
+            self.raise_alarm(notify_callback)
 
     def _decay(self, delta_time: float) -> None:
         if self.suspicion_meter > 0:
@@ -692,20 +817,21 @@ class NPC:
 
     def scold(self, kind: str, line: str, notify_callback: Notify, grace: bool = True,
               player: Optional[Player] = None) -> bool:
-        """Say ``line`` unless the same kind of warning was given within ``scold_cooldown``.
-        A warning opens a grace window: suspicion may climb but cannot trigger the alarm
-        until it has passed, giving the player time to do as they are told. A guard's
-        dressing-down is delivered to the player's face (``player`` turns towards them)."""
+        """Say ``line`` (a phrasing is picked when ``line`` names a dialogue kind) unless the same
+        kind of warning was given within ``scold_cooldown``. A warning opens a grace window:
+        suspicion may climb but cannot trigger the alarm until it has passed, giving the player
+        time to do as they are told. A guard's dressing-down holds the player's attention (the
+        controls lock and the view swings round to face them)."""
         last = self.last_scold.get(kind)
         if last is not None and self.clock - last < self.settings.scold_cooldown:
             return False
         self.last_scold[kind] = self.clock
         if grace:
             self.warning_grace_until = max(self.warning_grace_until, self.clock + self.settings.warning_grace)
-        if notify_callback:
-            notify_callback(line)
+        text = dialogue.line(line, self.rng) if line in dialogue.LINES else line
+        self.say(text, notify_callback)
         if player is not None and self.is_guard:
-            player.face_towards(self.position)
+            player.hold_attention(self.position, self.settings.scold_freeze_seconds)
         return True
 
     @property
@@ -738,40 +864,24 @@ class NPC:
             blocked = (not self.has_line_of_sight(player_pos, walls)) if hasattr(walls, "__iter__") else False
             if not blocked:
                 self.crimes_witnessed += 1
-                self.raise_alarm(
-                    notify_callback,
-                    f"({self.title} witnessed {crime_name}!): \"{self.guard_callout()}\"",
-                    f"({self.title} witnessed {crime_name}!): \"Thief! Guards!\"",
-                )
+                self.raise_alarm(notify_callback, self.guard_callout(), self.phrase("thief_guards"),
+                                 log_prefix=f"{self.title} witnessed {crime_name}!")
                 return True
         return False
 
-    GUARD_CALLOUTS = (
-        "Caught you red-handed!",
-        "Again?! Stop right there, thief!",
-        "That's enough! One more and you're coming with me!",
-        "You're under arrest the moment I get my hands on you!",
-    )
+    GUARD_CALLOUTS = dialogue.LINES["caught_red_handed"]
 
     def guard_callout(self) -> str:
         """Escalating line for the n-th crime this guard has seen (the last line repeats)."""
         return self.GUARD_CALLOUTS[min(self.crimes_witnessed, len(self.GUARD_CALLOUTS)) - 1]
 
     # ------------------------------------------------------------------ dialogue
-    def greeting(self) -> str:
-        if self.state is AIState.SLEEPING:
-            return f"({self.name}): \"Zzz... (fast asleep)\""
-        if self.is_guard:
-            return f"({self.name} [Guard]): \"Keep your nose clean, traveler. Move along.\""
-        if self.is_fence:
-            return f"({self.name} [Fence]): \"Got stolen goods? I'll buy them off you, no questions asked.\""
-        if self.can_trade and not self.is_open_for_business:
-            return f"({self.name} [Merchant]): \"The shop is closed right now. Come back during opening hours.\""
-        return f"({self.name} [Merchant]): \"Welcome to my shop! Take a look at my wares.\""
+    def greeting(self, hour: int = 12) -> str:
+        """One of several phrasings suited to who this is and whether they are open / awake."""
+        return dialogue.player_greeting(self, hour, self.rng)
 
-    def interact(self, notify_callback: Notify = None) -> None:
-        if notify_callback:
-            notify_callback(self.greeting())
+    def interact(self, notify_callback: Notify = None, hour: int = 12) -> None:
+        self.say(self.greeting(hour), notify_callback)
 
     # ------------------------------------------------------------------ inventory upkeep
     def reset_inventory(self, day: int) -> List[Item]:

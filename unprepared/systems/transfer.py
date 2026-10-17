@@ -36,6 +36,8 @@ class TransferOutcome(Enum):
     MOVED = "moved"
     NOT_ENOUGH_GOLD = "not_enough_gold"
     MERCHANT_BROKE = "merchant_broke"   # the merchant cannot afford what the player is selling
+    NOT_THEIR_TRADE = "not_their_trade" # a specialist does not deal in that kind of goods
+    SERVICE = "service"                 # a service (a room at the inn) was bought: nothing changes hands
     REFUSED_STOLEN = "refused_stolen"   # merchant calls the guards; session must end
     CAUGHT = "caught"                   # failed pickpocket: the victim noticed; session must end
     NOTHING = "nothing"                 # cursor on no item
@@ -91,10 +93,14 @@ class TradePolicy(TransferPolicy):
     right_label = "YOUR INVENTORY (SELL)"
 
     def __init__(self, merchant: NPC, player: Player, economy: EconomySettings, notify: Notify = None,
-                 rewards: Optional[SkillRewards] = None, progression_settings: Optional[ProgressionSettings] = None):
+                 rewards: Optional[SkillRewards] = None, progression_settings: Optional[ProgressionSettings] = None,
+                 on_service: Optional[Callable[[Item], bool]] = None,
+                 on_refused_stolen: Optional[Callable[[NPC], None]] = None):
         self.merchant, self.player, self.economy, self.notify = merchant, player, economy, notify
+        self.on_refused_stolen = on_refused_stolen   # the merchant's cry of "Guards!" reaches the world
         self.rewards = rewards or SkillRewards()
         self.progression = progression_settings or ProgressionSettings()
+        self.on_service = on_service          # handles "service" items (renting a room); returns False to refuse
 
     @property
     def title(self) -> str:
@@ -105,14 +111,22 @@ class TradePolicy(TransferPolicy):
 
     @property
     def barter_bonus(self) -> float:
+        """Raw haggling margin for the player's Barter level (before the value weighting)."""
         level = self.player.skills.level(SkillType.BARTER)
         return min(self.economy.barter_bonus_cap, self.economy.barter_bonus_per_level * (level - 1))
 
+    def barter_margin(self, value: float) -> float:
+        """How much of the margin applies to goods worth ``value``: next to nothing for a loaf
+        of bread, nearly all of it for a jewelled dagger - a master haggler profits on treasure."""
+        knee = self.economy.barter_value_knee
+        return self.barter_bonus * (value / (value + knee)) if value > 0 else 0.0
+
     def buy_price(self, item: Item) -> float:
-        return round(item.value * (1.0 - self.barter_bonus), 1)
+        return round(item.value * (1.0 - self.barter_margin(item.value)), 1)
 
     def sell_price(self, item: Item) -> float:
-        return round(item.sell_value(self.economy.stolen_goods_multiplier) * (1.0 + self.barter_bonus), 1)
+        base = item.sell_value(self.economy.stolen_goods_multiplier)
+        return round(base * (1.0 + self.barter_margin(base)), 1)
 
     def row_text(self, item: Item, side: Side, session: "TransferSession") -> str:
         if side is Side.LEFT:
@@ -128,6 +142,13 @@ class TradePolicy(TransferPolicy):
         if self.player.gold < price:
             self._say("Not enough gold to buy this item!")
             return TransferResult(TransferOutcome.NOT_ENOUGH_GOLD, item, price, Side.LEFT)
+        if item.category == "service":
+            if self.on_service is None or not self.on_service(item):
+                return TransferResult(TransferOutcome.NOT_THEIR_TRADE, item, price, Side.LEFT)
+            self.player.gold -= price
+            self.merchant.gold += price
+            self._train(price)
+            return TransferResult(TransferOutcome.SERVICE, item, price, Side.LEFT)
         self.player.gold -= price
         self.merchant.gold += price
         move_one(session.left_items, session.right_items, item, lambda unit: setattr(unit, "owner", Item.PLAYER_OWNER))
@@ -138,12 +159,17 @@ class TradePolicy(TransferPolicy):
 
     def give(self, session, item):
         if item.is_stolen and not self.merchant.is_fence:
-            self._say(f"({self.merchant.name}): \"That {item.name} is stolen! Guards!\"")
+            self.merchant.say(self.merchant.phrase("stolen_goods", item=item.name), self.notify)
             self.merchant.state = AIState.REPORTING
+            if self.on_refused_stolen is not None:
+                self.on_refused_stolen(self.merchant)
             return TransferResult(TransferOutcome.REFUSED_STOLEN, item, side=Side.RIGHT, close_session=True)
+        if not self.merchant.buys(item):
+            self.merchant.say(self.merchant.phrase("wrong_trade", role=self.merchant.role_tag or "specialist"), self.notify)
+            return TransferResult(TransferOutcome.NOT_THEIR_TRADE, item, side=Side.RIGHT)
         price = self.sell_price(item)
         if self.merchant.gold < price:
-            self._say(f"({self.merchant.name}): \"I can't afford that right now - I've only {self.merchant.gold:.0f}g in the till.\"")
+            self.merchant.say(self.merchant.phrase("cant_afford", gold=f"{self.merchant.gold:.0f}"), self.notify)
             return TransferResult(TransferOutcome.MERCHANT_BROKE, item, price, Side.RIGHT)
         self.player.gold += price
         self.merchant.gold -= price
@@ -197,9 +223,15 @@ class PickpocketPolicy(TransferPolicy):
             rows.insert(0, coin_purse(self.victim.gold))
         return rows
 
+    @property
+    def purse_grab(self) -> int:
+        """Coins a lift takes from a purse: a deft hand (Pickpocket level) takes a bigger handful."""
+        level = self.player.skills.level(SkillType.PICKPOCKET)
+        return self.economy.purse_grab + self.economy.purse_grab_per_level * max(0, level - 1)
+
     def row_text(self, item, side, session):
         if item.id == COIN_ITEM_ID and side is Side.LEFT:
-            return f"{item.display_name}  (grab up to {self.economy.purse_grab})"
+            return f"{item.display_name}  (grab up to {self.purse_grab})"
         return f"{item.display_name} ({item.value}g)"
 
     def _xp_magnitude(self, value: float) -> float:
@@ -225,7 +257,7 @@ class PickpocketPolicy(TransferPolicy):
             return TransferResult(TransferOutcome.CAUGHT, item, side=Side.LEFT, close_session=True)
 
         if item.id == COIN_ITEM_ID:
-            grabbed = float(min(self.economy.purse_grab, int(self.victim.gold)))
+            grabbed = float(min(self.purse_grab, int(self.victim.gold)))
             self.victim.gold -= grabbed
             self.player.gold += grabbed
             progression.grant(self.player, SkillType.PICKPOCKET, self._xp_magnitude(grabbed), notify=self.notify,
@@ -265,12 +297,16 @@ class ContainerPolicy(TransferPolicy):
 
     def __init__(self, container, player: Player, notify: Notify = None, report_crime: CrimeReport = None,
                  rewards: Optional[SkillRewards] = None, stealth: Optional[StealthSettings] = None,
-                 rng: Optional[random.Random] = None, progression_settings: Optional[ProgressionSettings] = None):
+                 rng: Optional[random.Random] = None, progression_settings: Optional[ProgressionSettings] = None,
+                 complimentary: Optional[Callable[[Item], bool]] = None,
+                 on_complimentary: Optional[Callable[[Item], None]] = None):
         self.container, self.player, self.notify, self.report_crime = container, player, notify, report_crime
         self.rewards = rewards or SkillRewards()
         self.stealth = stealth or StealthSettings()
         self.rng = rng or random.Random()
         self.progression = progression_settings or ProgressionSettings()
+        self.complimentary = complimentary        # items the owner lets the player help themselves to (inn food for a guest)
+        self.on_complimentary = on_complimentary  # told when one is taken (the keeper's stock count stays in step)
         self.title = container.label.upper()
         self.left_label = f"{container.label.upper()} (TAKE)"
 
@@ -278,14 +314,22 @@ class ContainerPolicy(TransferPolicy):
     def is_theft(self) -> bool:
         return self.container.owner is not None
 
+    def is_complimentary(self, item: Item) -> bool:
+        return self.complimentary is not None and self.complimentary(item)
+
     def row_text(self, item, side, session):
+        if side is Side.LEFT and self.is_theft and self.is_complimentary(item):
+            return f"{item.display_name} (on the house)"
         return f"{item.display_name} ({item.value}g)"
 
     def take(self, session, item):
-        if item.is_players or not self.is_theft:
+        if item.is_players or not self.is_theft or self.is_complimentary(item):
+            if self.is_theft and not item.is_players and self.on_complimentary is not None:
+                self.on_complimentary(item)
             move_one(session.left_items, session.right_items, item)
             if self.notify:
-                self.notify(f"Took back your {item.name}." if item.is_players else f"Took {item.name}.")
+                self.notify(f"Took back your {item.name}." if item.is_players
+                            else f"Took {item.name} (on the house)." if self.is_theft else f"Took {item.name}.")
             return TransferResult(TransferOutcome.MOVED, item, side=Side.LEFT)
         unnoticed = roll(self.rng, stealing_chance(self.player, self.stealth, self.progression))
         witnesses = []

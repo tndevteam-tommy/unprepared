@@ -10,9 +10,14 @@ OVERHANG = 0.4
 TILE = 2.0
 
 
+WALL_THICKNESS = 0.5
+
+
 def draw_floor(building, texture_id: int) -> None:
+    """Floorboards inside the walls (inset by the wall thickness so no edge peeks out at the base)."""
     (x1, z1), (x2, z2) = building.min_xz, building.max_xz
-    draw_textured_box(Vector3D(x1, 0.0, z1), Vector3D(x2, 0.05, z2), texture_id, tile=TILE)
+    inset = WALL_THICKNESS - 0.02
+    draw_textured_box(Vector3D(x1 + inset, 0.0, z1 + inset), Vector3D(x2 - inset, 0.05, z2 - inset), texture_id, tile=TILE)
 
 
 def draw_ceiling(building, texture_id: int) -> None:
@@ -33,8 +38,27 @@ def draw_ceiling(building, texture_id: int) -> None:
     glDisable(GL_TEXTURE_2D)
 
 
-def draw_roof(building, texture_id: int) -> None:
-    """Two sloped planes meeting at a ridge along the longer axis, closed by triangular gables."""
+FASCIA = 0.16          # boards around the roof base sealing the seam between roof and ceiling
+
+
+def draw_fascia(building, texture_id: int) -> None:
+    """Boards running around the roof base: they close the slit between the roof planes, the
+    gables and the ceiling underneath so no light or sky shows through at the eaves."""
+    (x1, z1), (x2, z2) = building.min_xz, building.max_xz
+    x1, z1, x2, z2 = x1 - OVERHANG, z1 - OVERHANG, x2 + OVERHANG, z2 + OVERHANG
+    base = building.wall_height
+    lo, hi = base - 0.22, base + 0.04
+    draw_textured_box(Vector3D(x1, lo, z1), Vector3D(x2, hi, z1 + FASCIA), texture_id, tile=1.0)
+    draw_textured_box(Vector3D(x1, lo, z2 - FASCIA), Vector3D(x2, hi, z2), texture_id, tile=1.0)
+    draw_textured_box(Vector3D(x1, lo, z1), Vector3D(x1 + FASCIA, hi, z2), texture_id, tile=1.0)
+    draw_textured_box(Vector3D(x2 - FASCIA, lo, z1), Vector3D(x2, hi, z2), texture_id, tile=1.0)
+
+
+def draw_roof(building, texture_id: int, fascia_texture_id: int = None) -> None:
+    """Two sloped planes meeting at a ridge along the longer axis, closed by triangular gables
+    and trimmed with fascia boards."""
+    if fascia_texture_id is not None:
+        draw_fascia(building, fascia_texture_id)
     (x1, z1), (x2, z2) = building.min_xz, building.max_xz
     x1, z1, x2, z2 = x1 - OVERHANG, z1 - OVERHANG, x2 + OVERHANG, z2 + OVERHANG
     base = building.wall_height

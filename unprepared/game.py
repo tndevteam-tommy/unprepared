@@ -60,12 +60,20 @@ class ScreenFade:
     HOLD_SECONDS = 0.2
     IN_SECONDS = 0.7
 
-    def __init__(self, on_black: Callable[[], None], delay: float = 0.0):
+    def __init__(self, on_black: Callable[[], None], delay: float = 0.0, out_seconds: Optional[float] = None,
+                 hold_seconds: Optional[float] = None, in_seconds: Optional[float] = None, reason: str = "relocation"):
         self.time = 0.0
         self.delay = delay                  # seconds the screen stays clear (and frozen) before fading
         self.on_black = on_black
         self.applied = False
         self.done = False
+        self.reason = reason
+        if out_seconds is not None:
+            self.OUT_SECONDS = out_seconds
+        if hold_seconds is not None:
+            self.HOLD_SECONDS = hold_seconds
+        if in_seconds is not None:
+            self.IN_SECONDS = in_seconds
 
     @property
     def alpha(self) -> float:
@@ -103,15 +111,17 @@ class Game:
         self.saves = SaveManager(save_file or settings.save_file, notify_callback=self.messages.add)
         self.rng = random.Random(settings.random_seed)
         self.world.rng = self.rng           # one RNG for every gameplay roll (seedable for scripted runs)
+        # The lock mini-game draws its sweet spots from a stream of its own so that scripted runs can
+        # predict them (the town's idle chatter would otherwise shuffle the world RNG unpredictably).
+        self.lockpick_rng = random.Random(settings.random_seed)
 
-        self.lockpicking = LockpickMinigame(settings.lockpick, rng=self.rng, rewards=settings.skill_rewards,
+        self.lockpicking = LockpickMinigame(settings.lockpick, rng=self.lockpick_rng, rewards=settings.skill_rewards,
                                             progression_settings=settings.progression)
         self.transfer: Optional[TransferSession] = None
         self.transfer_mode: GameMode = GameMode.EXPLORE
         self.target: Optional[InteractionTarget] = None
         self.confirmation: Optional[Confirmation] = None
         self.fade: Optional[ScreenFade] = None
-        self.freeze_timer = 0.0             # seconds the controls stay locked (just caught)
         self.pending_relocations: list = []
         self.world.relocation_handler = self._on_relocation
         self.world.caught_handler = self._on_caught
@@ -143,7 +153,7 @@ class Game:
     @property
     def frozen(self) -> bool:
         """Controls locked: just caught by a guard (a moment to take it in), or mid-fade."""
-        return self.freeze_timer > 0.0 or self.fade is not None
+        return self.player.frozen or self.fade is not None
 
     @property
     def fade_alpha(self) -> float:
@@ -193,8 +203,7 @@ class Game:
         self.player.update_stance(delta_time)
         self.player.noise_skill_multiplier = noise_multiplier(self.player, self.settings.stealth)
         self.lockpicking.update(delta_time)
-        if self.freeze_timer > 0.0:
-            self.freeze_timer = max(0.0, self.freeze_timer - delta_time)
+        self.player.update_turning(delta_time)
         if self.fade is not None:
             self.fade.update(delta_time)
             if self.fade.done:
@@ -202,6 +211,8 @@ class Game:
         if self.accepts_free_look:
             self.movement = apply_movement(self.player, move_intent, delta_time, self.settings.player,
                                            self.world.colliders())
+            p = self.player.position
+            p.y = self.world.floor_height_at(p.x, p.z, p.y)          # up or down the steps under our feet
         else:
             self.movement = MovementResult()
 
@@ -210,7 +221,34 @@ class Game:
         self.world.update_perception(self.player, self.movement.is_moving, self.movement.is_sprinting, delta_time)
         self.target = find_interaction_target(self.player, self.world.doors, self.world.npcs,
                                               self.settings.interaction, self.world.containers, self.world.walls,
-                                              self.world.stations, self.settings)
+                                              self.world.stations, self.settings,
+                                              beds=self.world.beds, may_sleep_in=self.world.player_may_sleep_in)
+
+    # ------------------------------------------------------------------ speech bubbles
+    HEAR_RADIUS = 12.0          # how far away talk can be made out
+    FACING_DOT = 0.3            # cos(~72 deg): the speaker must be roughly in front of the player
+
+    def speech_bubbles(self):
+        """(npc, Speech) for everyone currently talking whom the player can hear - close enough
+        and roughly in front of them (you hear people you face, even through a wall). The HUD
+        draws these above the speakers' heads; the log keeps every line regardless."""
+        from .core.math3d import view_direction
+        now = self.world.elapsed
+        p = self.player.position
+        vx, _, vz = view_direction(self.player.rotation_y, 0.0)
+        out = []
+        for npc in self.world.npcs:
+            speech = npc.current_speech(now)
+            if speech is None:
+                continue
+            dx, dz = npc.position.x - p.x, npc.position.z - p.z
+            dist = (dx * dx + dz * dz) ** 0.5
+            if dist > self.HEAR_RADIUS:
+                continue
+            if dist > 1e-6 and (vx * dx + vz * dz) / dist < self.FACING_DOT:
+                continue
+            out.append((npc, speech))
+        return out
 
     # ------------------------------------------------------------------ relocation & being caught
     def _on_relocation(self, request: Relocation) -> None:
@@ -231,10 +269,9 @@ class Game:
         self.world.push_out_of_doors(self.player)
 
     def _on_caught(self, npc) -> None:
-        """An NPC has the player bang to rights: every mini-game / pocket screen closes and the
-        controls lock for a moment so the player can take in what just happened."""
+        """An NPC has the player bang to rights: every mini-game / pocket screen closes (the
+        world has already locked the controls and started the turn towards them)."""
         self.close_screens()
-        self.freeze_timer = max(self.freeze_timer, self.settings.justice.caught_freeze_seconds)
 
     def close_screens(self) -> None:
         """Shut the lockpicking mini-game, any transfer screen and any question."""
@@ -306,7 +343,8 @@ class Game:
             return False
         self.close_screens()
         self.fade = None
-        self.freeze_timer = 0.0
+        self.player.freeze_timer = 0.0
+        self.player.turn_target = None
         self.pending_relocations.clear()
         return self.saves.load(self.world, self.player, path)
 
@@ -377,6 +415,33 @@ class Game:
             use_station(self.player, self.target.obj, self.settings, self.messages.add, rng=self.rng)
         elif self.target.is_npc:
             self._interact_npc(self.target.obj, self.target.npc_action)
+        elif self.target.is_bed:
+            self.sleep_until_morning(self.target.obj)
+
+    # ------------------------------------------------------------------ sleeping
+    WAKE_HOUR = 6
+
+    def sleep_until_morning(self, bed=None) -> bool:
+        """Sleep in a bed that is the player's (their own, or the room they are renting): the
+        screen fades slowly to black, the night passes (the town lives on), and it is 06:00
+        when it comes back. The same for every bed the player may use."""
+        if bed is not None and not self.world.player_may_sleep_in(bed):
+            self.messages.add("That is not your bed.")
+            return False
+        if self.fade is not None:
+            return False
+        self.close_screens()
+        self.messages.add("You settle down to sleep...")
+        self.fade = ScreenFade(self._sleep_through_the_night, out_seconds=1.8, hold_seconds=0.8, in_seconds=1.4, reason="sleep")
+        return True
+
+    def hours_until_morning(self) -> float:
+        hours = (self.WAKE_HOUR - self.world.clock.fractional_hour) % 24.0
+        return hours if hours > 0.05 else 24.0
+
+    def _sleep_through_the_night(self) -> None:
+        self.world.wait_until(self.WAKE_HOUR)
+        self.messages.add(f"You wake at {self.world.clock.hour:02d}:00, rested.")
 
     def _interact_container(self, container) -> None:
         if not getattr(container, "is_locked", False):
@@ -423,15 +488,29 @@ class Game:
         else:
             if not npc.is_asleep:
                 npc.turn_towards(self.player.position)
-            npc.interact(notify_callback=self.messages.add)
+            npc.interact(notify_callback=self.messages.add, hour=self.world.simulated_hour)
             if action is NPCAction.TRADE:
                 self.open_trade(npc)
 
     # ------------------------------------------------------------------ transfer sessions
     def open_trade(self, merchant) -> TransferSession:
         policy = TradePolicy(merchant, self.player, self.settings.economy, notify=self.messages.add,
-                             rewards=self.settings.skill_rewards, progression_settings=self.settings.progression)
+                             rewards=self.settings.skill_rewards, progression_settings=self.settings.progression,
+                             on_service=self._buy_service, on_refused_stolen=self._merchant_reports_fencing)
         return self._open_transfer(self.world.merchant_stock(merchant), policy, GameMode.TRADE)
+
+    def _merchant_reports_fencing(self, merchant) -> None:
+        """An honest merchant offered stolen goods shouts for the guards: they come running and
+        hold it against you (a reported crime - only the merchant saw it)."""
+        self.world.declare_crime("Fencing stolen goods", self.player.position.copy(), witnessed=False, reporter=merchant.name)
+
+    def _buy_service(self, item) -> bool:
+        """Service items in a merchant's stock: a room at the inn for a night or a week."""
+        from .world.inn import RENT_ITEMS
+        nights = RENT_ITEMS.get(item.id)
+        if nights is None or not self.world.inn.present:
+            return False
+        return self.world.inn.rent(self.world, self.player, nights, self.messages.add)
 
     def open_pickpocket(self, victim) -> TransferSession:
         """Opening the pockets is itself a crime bystanders may witness."""
@@ -460,7 +539,9 @@ class Game:
     def open_container(self, container) -> TransferSession:
         policy = ContainerPolicy(container, self.player, notify=self.messages.add, report_crime=self.report_crime,
                                  rewards=self.settings.skill_rewards, stealth=self.settings.stealth, rng=self.rng,
-                                 progression_settings=self.settings.progression)
+                                 progression_settings=self.settings.progression,
+                                 complimentary=lambda item: self.world.is_complimentary(container, item),
+                                 on_complimentary=lambda item: self.world.note_complimentary(container, item))
         return self._open_transfer(container.inventory, policy, GameMode.CONTAINER)
 
     def _open_transfer(self, left_items, policy, mode: GameMode) -> TransferSession:

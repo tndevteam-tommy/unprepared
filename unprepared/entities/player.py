@@ -24,6 +24,8 @@ class Player:
         self.skills = SkillTree()
         self.current_eye_height = self.settings.eye_height   # animates between standing/crouching
         self.crimes_witnessed = 0                            # times an NPC caught the player in the act
+        self.freeze_timer = 0.0                              # controls locked (just caught / being told off)
+        self.turn_target: Optional[Vector3D] = None          # where the view is swinging towards
 
     # --- queries -----------------------------------------------------------
     @property
@@ -70,7 +72,7 @@ class Player:
         p = position or self.position
         s = self.settings
         return BoundingBox3D(
-            Vector3D(p.x - s.collision_radius, p.y - s.collision_foot_depth, p.z - s.collision_radius),
+            Vector3D(p.x - s.collision_radius, p.y + s.collision_foot_clearance, p.z - s.collision_radius),
             Vector3D(p.x + s.collision_radius, p.y + s.collision_head_height, p.z + s.collision_radius),
         )
 
@@ -92,12 +94,45 @@ class Player:
         return (ambient_light + torch_light) * stance_mod
 
     # --- mutations ----------------------------------------------------------
-    def face_towards(self, target: Vector3D) -> None:
-        """Snap the view to look at ``target`` (level pitch) - used when an NPC confronts the player."""
+    @property
+    def frozen(self) -> bool:
+        return self.freeze_timer > 0.0
+
+    def yaw_towards(self, target: Vector3D) -> float:
         dx, dz = target.x - self.position.x, target.z - self.position.z
-        if dx or dz:
-            self.rotation_y = math.degrees(math.atan2(dx, -dz)) % 360.0
+        return math.degrees(math.atan2(dx, -dz)) % 360.0 if (dx or dz) else self.rotation_y
+
+    def face_towards(self, target: Vector3D) -> None:
+        """Snap the view to look at ``target`` (level pitch)."""
+        self.rotation_y = self.yaw_towards(target)
         self.rotation_x = 0.0
+        self.turn_target = None
+
+    def hold_attention(self, target: Vector3D, seconds: float) -> None:
+        """An NPC has the player's attention: the controls lock for ``seconds`` and the view
+        swings smoothly round to face them (``update_turning``) instead of snapping."""
+        self.freeze_timer = max(self.freeze_timer, seconds)
+        self.turn_target = target.copy()
+
+    def update_turning(self, delta_time: float) -> None:
+        """Advance the freeze timer and the smooth turn towards ``turn_target``."""
+        if self.freeze_timer > 0.0:
+            self.freeze_timer = max(0.0, self.freeze_timer - delta_time)
+        if self.turn_target is None:
+            return
+        speed = self.settings.attention_turn_speed * delta_time
+        target_yaw = self.yaw_towards(self.turn_target)
+        diff = (target_yaw - self.rotation_y + 180.0) % 360.0 - 180.0
+        if abs(diff) <= speed:
+            self.rotation_y = target_yaw
+        else:
+            self.rotation_y = (self.rotation_y + math.copysign(speed, diff)) % 360.0
+        if abs(self.rotation_x) <= speed:
+            self.rotation_x = 0.0
+        else:
+            self.rotation_x -= math.copysign(speed, self.rotation_x)
+        if self.rotation_y == target_yaw and self.rotation_x == 0.0:
+            self.turn_target = None
 
     def look(self, dx_pixels: float, dy_pixels: float) -> None:
         s = self.settings

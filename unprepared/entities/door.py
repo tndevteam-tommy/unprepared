@@ -53,6 +53,7 @@ class Door:
     lock_difficulty: int = 1           # 1 (simple latch) .. 5 (master lock): shrinks the lockpicking sweet spot
     kind: DoorKind = DoorKind.LEAF
     sealed: bool = False               # BARS only: a prisoner is inside - no NPC opens it, whatever keys it has
+    swing_out: bool = False            # the leaf folds into +z when open instead of -z
 
     @property
     def is_bars(self) -> bool:
@@ -87,11 +88,19 @@ class Door:
         return Vector3D(h.x + self.width / 2.0, h.y, h.z)
 
     def collider(self) -> BoundingBox3D:
-        """Solid box of the leaf in its current pose (closed: across the doorway; open: folded into -z)."""
+        """Solid box of the leaf in its current pose (closed: across the doorway; open: folded
+        into -z, or +z for a ``swing_out`` door)."""
         h, half = self.hinge_position, self.thickness / 2.0
         if self.is_open:
+            if self.swing_out:
+                return BoundingBox3D(Vector3D(h.x - half, h.y, h.z - half), Vector3D(h.x + half, h.y + self.height, h.z + self.width))
             return BoundingBox3D(Vector3D(h.x - half, h.y, h.z - self.width), Vector3D(h.x + half, h.y + self.height, h.z + half))
         return BoundingBox3D(Vector3D(h.x, h.y, h.z - half), Vector3D(h.x + self.width, h.y + self.height, h.z + half))
+
+    @property
+    def open_angle(self) -> float:
+        """Degrees the leaf turns about the hinge when open (the renderer's rotation)."""
+        return -90.0 if self.swing_out else 90.0
 
     # --- state ------------------------------------------------------------------------
     def toggle(self) -> bool:

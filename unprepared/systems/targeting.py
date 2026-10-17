@@ -19,6 +19,7 @@ class TargetKind(Enum):
     NPC = "npc"
     CONTAINER = "container"
     STATION = "station"
+    BED = "bed"
 
 
 class NPCAction(Enum):
@@ -50,6 +51,10 @@ class InteractionTarget:
     @property
     def is_station(self) -> bool:
         return self.kind is TargetKind.STATION
+
+    @property
+    def is_bed(self) -> bool:
+        return self.kind is TargetKind.BED
 
 
 def door_prompt(door: Door, player: Player) -> str:
@@ -111,9 +116,14 @@ def _inflate(box: BoundingBox3D, amount: float) -> BoundingBox3D:
                          Vector3D(box.max_point.x + amount, box.max_point.y + amount, box.max_point.z + amount))
 
 
+def bed_prompt(bed, may_sleep: bool) -> str:
+    return "[E] Sleep Until Morning" if may_sleep else "[Not your bed]"
+
+
 def find_interaction_target(player: Player, doors: Sequence[Door], npcs: Sequence[NPC],
                             settings: InteractionSettings, containers: Sequence = (),
-                            occluders: Sequence = (), resources: Sequence = (), game_settings=None) -> Optional[InteractionTarget]:
+                            occluders: Sequence = (), resources: Sequence = (), game_settings=None,
+                            beds: Sequence = (), may_sleep_in=None) -> Optional[InteractionTarget]:
     """What the crosshair is on, else the best candidate inside the aim cone.
 
     1. **Crosshair ray.** A ray from the camera along the view direction is cast against
@@ -140,6 +150,8 @@ def find_interaction_target(player: Player, doors: Sequence[Door], npcs: Sequenc
             return InteractionTarget(kind, obj, container_prompt(obj, player))
         if kind is TargetKind.STATION:
             return InteractionTarget(kind, obj, resource_prompt(obj, player, game_settings))
+        if kind is TargetKind.BED:
+            return InteractionTarget(kind, obj, bed_prompt(obj, bool(may_sleep_in and may_sleep_in(obj))))
         action = npc_action(obj, player, settings)
         return InteractionTarget(kind, obj, npc_prompt(obj, action), action)
 
@@ -148,7 +160,8 @@ def find_interaction_target(player: Player, doors: Sequence[Door], npcs: Sequenc
     blocker_distance = min((d for d in (ray_box_distance(cam, view_dir, box, max_reach) for box in occluders)
                             if d is not None), default=float("inf"))
     best_hit = None
-    candidates = _ray_candidates(player, doors, npcs, containers, resources, settings) if settings.crosshair_ray else ()
+    bed_hit = None
+    candidates = _ray_candidates(player, doors, npcs, containers, resources, settings, beds) if settings.crosshair_ray else ()
     for kind, obj, box, reach in candidates:
         if cam.distance_to(_box_center(box)) > reach + 2.0:
             continue
@@ -159,8 +172,14 @@ def find_interaction_target(player: Player, doors: Sequence[Door], npcs: Sequenc
             continue
         if kind is not TargetKind.DOOR and any(_hits_before(cam, view_dir, leaf, t) for leaf in closed_leaves):
             continue                         # something behind a shut door
+        if kind is TargetKind.BED:           # a bed only counts when nothing (nobody asleep on it) is hit
+            if bed_hit is None or t < bed_hit[0]:
+                bed_hit = (t, kind, obj)
+            continue
         if best_hit is None or t < best_hit[0]:
             best_hit = (t, kind, obj)
+    if best_hit is None and bed_hit is not None:
+        best_hit = bed_hit
     if best_hit is not None:
         return make(best_hit[1], best_hit[2])
 
@@ -218,10 +237,12 @@ def _box_center(box: BoundingBox3D) -> Vector3D:
                     (box.min_point.z + box.max_point.z) / 2)
 
 
-def _ray_candidates(player, doors, npcs, containers, resources, settings):
+def _ray_candidates(player, doors, npcs, containers, resources, settings, beds=()):
     """(kind, object, solid box, reach) for everything the crosshair ray may hit."""
     for door in doors:
         yield TargetKind.DOOR, door, door.collider(), settings.door_range
+    for bed in beds:                                  # beds only answer to the crosshair, never the aim cone
+        yield TargetKind.BED, bed, bed, settings.container_range
     for container in containers:
         yield TargetKind.CONTAINER, container, container, settings.container_range
     for node in resources:

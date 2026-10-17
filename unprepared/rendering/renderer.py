@@ -78,14 +78,13 @@ class Renderer:
         self._applied_fov = self.graphics.fov
 
     def render_frame(self, game) -> None:
-        if self.graphics.fov != self._applied_fov:
-            self.apply_projection()
-        self.scene.render(game)
+        self.render_scene_only(game)
         self.hud.render(game)
 
     def render_scene_only(self, game) -> None:
         if self.graphics.fov != self._applied_fov:
             self.apply_projection()
+        self.hud.fov = self.graphics.fov
         self.scene.render(game)
 
     def release(self) -> None:

@@ -41,18 +41,22 @@ class PlayerSettings:
     walk_speed: float = 4.0            # world units / second
     sprint_multiplier: float = 1.8
     crouch_speed_multiplier: float = 0.5   # sneaking is slow
+    attention_turn_speed: float = 150.0    # degrees/s the view swings round when an NPC demands attention
     mouse_sensitivity: float = 0.15    # degrees per pixel
     max_pitch: float = 89.0
-    eye_height: float = 1.6            # camera offset above ``player.position`` when standing
+    # ``player.position`` is at the feet (y = the floor), like an NPC's. The townsfolk stand 1.74 tall
+    # with their eyes at 1.6, so the camera sits a touch below that: nobody towers over anybody.
+    eye_height: float = 1.55           # camera offset above ``player.position`` when standing
     crouch_eye_height: float = 0.9     # ... and when crouching
     stance_transition_speed: float = 4.0   # eye height change per second between the two
     torch_light_height: float = 1.0
     starting_gold: float = 50.0
-    # Collision: the player is a box ``collision_radius`` wide around ``position``
-    # reaching from ``position.y - collision_foot_depth`` up to ``position.y + collision_head_height``.
+    # Collision: the player is a box ``collision_radius`` wide around ``position`` reaching from
+    # ``position.y + collision_foot_clearance`` (low lips and steps do not catch the feet) up to
+    # ``position.y + collision_head_height``.
     collision_radius: float = 0.3
-    collision_foot_depth: float = 1.0
-    collision_head_height: float = 1.0
+    collision_foot_clearance: float = 0.25
+    collision_head_height: float = 1.7
     # Stealth model
     noise_walk: float = 1.5
     noise_sprint: float = 3.0
@@ -96,11 +100,12 @@ class LockpickSettings:
 
 @dataclass(frozen=True)
 class NPCSettings:
-    move_speed: float = 2.5            # world units / second while travelling
+    move_speed: float = 3.6            # world units / second while travelling (a brisk walk; the player sprints at 7.2)
     patrol_pause: float = 2.0          # seconds spent at each patrol waypoint
     arrival_tolerance: float = 0.15    # distance at which a waypoint counts as reached
     door_operate_reach: float = 0.9    # how close (beyond the door box) an NPC opens a door it walks through
     door_lock_clearance: float = 1.5   # distance past a door before an NPC locks it behind itself
+    locked_out_retry: float = 15.0     # seconds between attempts to get into a place that was shut
 
 
 @dataclass(frozen=True)
@@ -114,9 +119,12 @@ class NavigationSettings:
 class EconomySettings:
     stolen_goods_multiplier: float = 0.5
     forged_lockpick_value: float = 5.0
-    purse_grab: int = 20               # coins lifted per successful pickpocket of a purse
-    barter_bonus_per_level: float = 0.01    # better prices per Barter level (sell up, buy down)
-    barter_bonus_cap: float = 0.5           # at most +50% sell / -50% buy
+    purse_grab: int = 20               # coins lifted per successful pickpocket of a purse at Pickpocket level 1 ...
+    purse_grab_per_level: int = 2      # ... plus this many per level above it
+    barter_bonus_per_level: float = 0.015   # better prices per Barter level (sell up, buy down) ...
+    barter_bonus_cap: float = 0.75          # ... up to +75% on a sale / -75% on a purchase ...
+    barter_value_knee: float = 60.0         # ... scaled by value/(value+knee): trinkets barely move, treasures do
+    pantry_restock_days: int = 3            # households top their kitchen tables back up this often (midnight)
 
 
 @dataclass(frozen=True)
@@ -163,6 +171,7 @@ class PerceptionSettings:
     shout_radius: float = 60.0             # how far a cry of "Guards!" carries in the open ...
     shout_wall_attenuation: float = 0.5    # ... and the fraction of that through walls
     scold_cooldown: float = 15.0           # seconds before an NPC repeats the same warning
+    scold_freeze_seconds: float = 1.2      # a guard's warning holds the player's attention (controls lock, view turns)
     warning_grace: float = 6.0             # seconds after a warning during which suspicion cannot reach the alarm
     # Suspicion rates are per second of simulated time (alarm at 100).
     heard_suspicion_gain: float = 40.0     # being heard next to an awake NPC: alarm in 2.5 s
@@ -213,13 +222,14 @@ class StealthSettings:
 @dataclass(frozen=True)
 class JusticeSettings:
     fines: Tuple[Tuple[str, float], ...] = (("Pickpocketing", 25.0), ("Lockpicking a door", 30.0), ("Shoplifting", 20.0),
-                                             ("Theft", 20.0), ("Trespassing", 15.0), ("Jailbreak", 60.0))
+                                             ("Theft", 20.0), ("Trespassing", 15.0), ("Jailbreak", 60.0),
+                                             ("Fencing stolen goods", 30.0))
     default_fine: float = 20.0
     gold_per_jail_day: float = 20.0      # sentence length = ceil(unpaid fine / this)
     min_jail_days: int = 1
     max_jail_days: int = 14
     release_hour: int = 6                # prisoners are let out at this hour of their last day
-    caught_freeze_seconds: float = 2.0   # controls lock while a guard has the player bang to rights ...
+    caught_freeze_seconds: float = 2.0   # controls lock while a guard has the player bang to rights
     jail_fade_delay: float = 2.0         # ... and the fade to the cell waits this long so it sinks in
     release_grace: float = 180.0         # seconds a released prisoner may linger to collect their things
     curfew_ask_interval: float = 8.0     # seconds between a resident's requests to leave at night
@@ -252,6 +262,7 @@ class LightingSettings:
     torch_color: Color3 = (1.3, 0.9, 0.45)
     lantern_color: Color3 = (1.5, 1.1, 0.62)     # indoor wall lanterns
     candle_color: Color3 = (1.1, 0.8, 0.42)      # table candles
+    fire_color: Color3 = (1.6, 0.9, 0.4)         # the smith's forge
     torch_range: float = 11.0
     player_torch_range: float = 14.0
     torch_flicker: float = 0.12
@@ -284,6 +295,10 @@ class HudColors:
     sweet_spot_text: RGB = (255, 230, 0)
     stolen_tag: RGB = (255, 70, 70)
     scroll_hint: RGB = (170, 170, 190)
+    bubble: Color4 = (0.85, 0.82, 0.7, 0.95)          # speech bubble border
+    bubble_fill: Color4 = (0.12, 0.11, 0.14, 0.92)    # speech bubble panel
+    bubble_name: RGB = (255, 215, 0)
+    bubble_text: RGB = (245, 240, 225)
 
 
 @dataclass(frozen=True)

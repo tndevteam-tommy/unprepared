@@ -30,18 +30,19 @@ def rooms_of(level: LevelDefinition, building: BuildingDef) -> List[AreaDef]:
         cx, cz = (area.min_xz[0] + area.max_xz[0]) / 2.0, (area.min_xz[1] + area.max_xz[1]) / 2.0
         if x1 <= cx <= x2 and z1 <= cz <= z2:
             rooms.append(area)
-    # drop an area that merely spans the whole building when it has sub-rooms inside it
-    inner = [r for r in rooms if not (r.min_xz[0] <= x1 + 0.01 and r.max_xz[0] >= x2 - 0.01
-                                      and r.min_xz[1] <= z1 + 0.01 and r.max_xz[1] >= z2 - 0.01)]
-    if inner and len(inner) < len(rooms):
-        outer = [r for r in rooms if r not in inner]
-        # keep the outer area only where its own centre is not already inside an inner room
-        for area in outer:
-            cx, cz = (area.min_xz[0] + area.max_xz[0]) / 2.0, (area.min_xz[1] + area.max_xz[1]) / 2.0
-            if not any(r.contains(cx, cz) for r in inner):
-                inner.append(area)
-        rooms = inner
     return rooms
+
+
+def _inner_rooms(rooms: Sequence[AreaDef], room: AreaDef) -> List[AreaDef]:
+    """Rooms lying inside ``room`` (the hall of an inn contains the guest rooms and the kitchen)."""
+    inner = []
+    for other in rooms:
+        if other is room:
+            continue
+        if (room.min_xz[0] <= other.min_xz[0] and room.max_xz[0] >= other.max_xz[0]
+                and room.min_xz[1] <= other.min_xz[1] and room.max_xz[1] >= other.max_xz[1]):
+            inner.append(other)
+    return inner
 
 
 def _door_walls(level: LevelDefinition, building: BuildingDef) -> set:
@@ -63,8 +64,10 @@ def _door_walls(level: LevelDefinition, building: BuildingDef) -> set:
     return sides
 
 
-def lantern_for_room(level: LevelDefinition, building: BuildingDef, min_xz, max_xz, name: str) -> LightDef:
-    """Mount a lantern on the nearest doorless building wall bordering the room."""
+def lantern_for_room(level: LevelDefinition, building: BuildingDef, min_xz, max_xz, name: str,
+                     avoid: Sequence[AreaDef] = ()) -> LightDef:
+    """Mount a lantern on the nearest doorless building wall bordering the room, skipping
+    spots that would fall inside one of the ``avoid`` rooms (sub-rooms of a hall)."""
     (bx1, bz1), (bx2, bz2) = building.min_xz, building.max_xz
     cx, cz = (min_xz[0] + max_xz[0]) / 2.0, (min_xz[1] + max_xz[1]) / 2.0
     doors = _door_walls(level, building)
@@ -77,6 +80,8 @@ def lantern_for_room(level: LevelDefinition, building: BuildingDef, min_xz, max_
         candidates.append((cx - bx1, "west", (bx1 + LANTERN_INSET, LANTERN_HEIGHT, cz), 90.0))
     if abs(max_xz[0] - bx2) < 0.6:
         candidates.append((bx2 - cx, "east", (bx2 - LANTERN_INSET, LANTERN_HEIGHT, cz), 270.0))
+    clear = [c for c in candidates if not any(r.contains(c[2][0], c[2][2]) for r in avoid)]
+    candidates = clear or candidates
     if not candidates:      # an inner room touching no outer wall: hang it from its own north edge
         candidates.append((0.0, "north", (cx, LANTERN_HEIGHT, min_xz[1] + LANTERN_INSET), 180.0))
     preferred = [c for c in candidates if c[1] not in doors] or candidates
@@ -90,10 +95,13 @@ def generate_fixtures(level: LevelDefinition, tables: Sequence = ()) -> List[Lig
     fixtures: List[LightDef] = list(level.lights)
     if level.auto_lights:
         for building in level.buildings:
+            if building.open_sides:
+                continue                                   # a roof on posts: no walls to hang a lantern on
             rooms = rooms_of(level, building)
             if rooms:
                 for room in rooms:
-                    fixtures.append(lantern_for_room(level, building, room.min_xz, room.max_xz, room.name))
+                    fixtures.append(lantern_for_room(level, building, room.min_xz, room.max_xz, room.name,
+                                                     avoid=_inner_rooms(rooms, room)))
             else:
                 fixtures.append(lantern_for_room(level, building, building.min_xz, building.max_xz, building.name))
         for table in tables:

@@ -23,6 +23,9 @@ Cell = Tuple[int, int]
 _NEIGHBOURS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
 
 
+HEAD_HEIGHT = 1.9      # obstacles starting above this are walked under
+
+
 class NavGrid:
     def __init__(self, obstacles: Iterable[BoundingBox3D], settings: NavigationSettings = NavigationSettings(),
                  walls: Iterable[BoundingBox3D] = ()):
@@ -36,9 +39,11 @@ class NavGrid:
         self.static_blocked = np.zeros((self.cols, self.rows), dtype=bool)
         self.wall_mask = np.zeros((self.cols, self.rows), dtype=bool)
         for box in obstacles:
-            self._rasterise(self.static_blocked, box, inflate=settings.agent_radius)
+            if box.min_point.y < HEAD_HEIGHT:          # a lintel or a window piece up a wall is no obstacle on the ground
+                self._rasterise(self.static_blocked, box, inflate=settings.agent_radius)
         for box in walls:
-            self._rasterise(self.wall_mask, box, inflate=settings.agent_radius)
+            if box.min_point.y < HEAD_HEIGHT:
+                self._rasterise(self.wall_mask, box, inflate=settings.agent_radius)
 
     # ------------------------------------------------------------------ grid <-> world
     def to_cell(self, x: float, z: float) -> Cell:

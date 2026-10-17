@@ -167,11 +167,11 @@ def draw_bars(width: float, height: float, thickness: float, texture_id: int) ->
                           texture_id, tile=None)
 
 
-def draw_door(door: Door, texture_id: int, open_angle: float = 90.0, bars_texture_id: Optional[int] = None) -> None:
+def draw_door(door: Door, texture_id: int, open_angle: Optional[float] = None, bars_texture_id: Optional[int] = None) -> None:
     glPushMatrix()
     glTranslatef(door.hinge_position.x, door.hinge_position.y, door.hinge_position.z)
     if door.is_open:
-        glRotatef(open_angle, 0.0, 1.0, 0.0)
+        glRotatef(open_angle if open_angle is not None else getattr(door, "open_angle", 90.0), 0.0, 1.0, 0.0)
     if getattr(door, "is_bars", False):
         draw_bars(door.width, door.height, door.thickness, bars_texture_id if bars_texture_id is not None else texture_id)
     else:
